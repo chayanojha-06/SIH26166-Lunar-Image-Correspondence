@@ -3,27 +3,41 @@ import numpy as np
 import os
 from datetime import datetime
 
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
 # ============================================================
-# SIH26166 - V2 ROBUST LUNAR IMAGE CORRESPONDENCE SYSTEM
+# SIH26166 - V3 AI-ASSISTED LUNAR IMAGE CORRESPONDENCE SYSTEM
 #
-# Multi-hypothesis:
-#   1. Baseline
-#   2. CLAHE
-#   3. Upscale
-#   4. Upscale + CLAHE
-#
-# Pipeline:
-#   SIFT
-#   -> Lowe ratio matching
-#   -> spatial consistency
-#   -> Homography verification
-#   -> Fundamental verification
-#   -> weighted consensus
-#   -> final localization
+# V3 FEATURES
+# ------------------------------------------------------------
+# 1. Multi-hypothesis preprocessing
+# 2. SIFT feature extraction
+# 3. Lowe ratio matching
+# 4. Mutual correspondence verification
+# 5. Homography verification
+# 6. Fundamental matrix verification
+# 7. Spatial distribution analysis
+# 8. Lightweight CPU ML confidence model
+# 9. Multi-signal evidence fusion
+# 10. Cross-hypothesis consensus localization
+# 11. Visualization
+# 12. Automatic text report
 #
 # IMPORTANT:
-# V2 is a prototype. Confidence is an internal score, not
-# scientific probability.
+# The ML component scores correspondence reliability.
+# Geometry remains the primary localization verifier.
+#
+# CPU-FIRST DESIGN
+# No PyTorch
+# No TensorFlow
+# No CUDA
+# No GPU requirement
+# ============================================================
+
+
+# ============================================================
+# PATHS
 # ============================================================
 
 REFERENCE_IMAGE = "data/raw/image1.jpg"
@@ -36,19 +50,17 @@ REPORT_DIR = os.path.join(OUTPUT_DIR, "reports")
 os.makedirs(VIS_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
 
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
 SIFT_FEATURES = 12000
 
-# Slightly relaxed because lunar imagery can have large
-# illumination / scale differences.
-LOWE_RATIO = 0.82
+LOWE_RATIO = 0.80
 
-# RANSAC thresholds
 FUNDAMENTAL_THRESHOLD = 2.0
-HOMOGRAPHY_THRESHOLD = 5.0
+HOMOGRAPHY_THRESHOLD = 4.0
 
 RANSAC_CONFIDENCE = 0.999
 RANSAC_ITERATIONS = 5000
@@ -56,14 +68,13 @@ RANSAC_ITERATIONS = 5000
 GRID_ROWS = 4
 GRID_COLS = 4
 
-# Minimum evidence gates
-MIN_GOOD_MATCHES = 8
-MIN_FUNDAMENTAL_INLIERS = 8
-MIN_HOMOGRAPHY_INLIERS = 6
+MIN_MATCHES = 8
+MIN_INLIERS = 6
 
-# Consensus
-MIN_CONSENSUS_RADIUS = 350.0
-MAX_CONSENSUS_RADIUS = 650.0
+# AI model configuration
+AI_ESTIMATORS = 80
+AI_RANDOM_STATE = 42
+
 
 # ============================================================
 # HEADER
@@ -71,8 +82,9 @@ MAX_CONSENSUS_RADIUS = 650.0
 
 print("=" * 78)
 print("SIH26166 LUNAR IMAGE CORRESPONDENCE SYSTEM")
-print("V2 ROBUST MULTI-SIGNAL LOCALIZATION PIPELINE")
+print("V3 AI-ASSISTED CPU-FIRST LOCALIZATION PIPELINE")
 print("=" * 78)
+
 
 # ============================================================
 # LOAD IMAGES
@@ -149,8 +161,13 @@ def create_hypotheses(image):
     }
 
 
-reference_hypotheses = create_hypotheses(reference)
-target_hypotheses = create_hypotheses(target)
+reference_hypotheses = create_hypotheses(
+    reference
+)
+
+target_hypotheses = create_hypotheses(
+    target
+)
 
 
 # ============================================================
@@ -172,25 +189,31 @@ def extract_features(image):
 
     sift = cv2.SIFT_create(
         nfeatures=SIFT_FEATURES,
-        contrastThreshold=0.015,
+        contrastThreshold=0.02,
         edgeThreshold=10
     )
 
-    keypoints, descriptors = sift.detectAndCompute(
-        gray,
-        None
+    keypoints, descriptors = (
+        sift.detectAndCompute(
+            gray,
+            None
+        )
     )
 
     return keypoints, descriptors
 
 
 # ============================================================
-# LOWE RATIO MATCHING
+# ONE-WAY MATCHING
 # ============================================================
 
-def match_features(des1, des2):
+def ratio_matches(
+    des1,
+    des2
+):
 
     if des1 is None or des2 is None:
+
         return []
 
     matcher = cv2.BFMatcher(
@@ -220,39 +243,50 @@ def match_features(des1, des2):
 
 
 # ============================================================
-# MATCH DISTANCE FILTER
+# MUTUAL MATCHING
 # ============================================================
 
-def distance_filter(matches):
+def mutual_matching(
+    des1,
+    des2
+):
 
-    if len(matches) < 8:
-        return matches
-
-    distances = np.array(
-        [m.distance for m in matches],
-        dtype=np.float32
+    forward = ratio_matches(
+        des1,
+        des2
     )
 
-    median_distance = np.median(
-        distances
+    backward = ratio_matches(
+        des2,
+        des1
     )
 
-    # Keep matches that are not extreme outliers.
-    threshold = max(
-        median_distance * 2.5,
-        1.0
-    )
+    if not forward or not backward:
+        return []
 
-    filtered = [
-        m for m in matches
-        if m.distance <= threshold
-    ]
+    backward_pairs = set()
 
-    # Never destroy a usable set completely.
-    if len(filtered) < 8:
-        return matches
+    for m in backward:
 
-    return filtered
+        backward_pairs.add(
+            (
+                m.trainIdx,
+                m.queryIdx
+            )
+        )
+
+    mutual = []
+
+    for m in forward:
+
+        if (
+            m.queryIdx,
+            m.trainIdx
+        ) in backward_pairs:
+
+            mutual.append(m)
+
+    return mutual
 
 
 # ============================================================
@@ -285,14 +319,26 @@ def calculate_fundamental(
         for m in matches
     ])
 
-    F, mask = cv2.findFundamentalMat(
-        pts1,
-        pts2,
-        cv2.FM_RANSAC,
-        FUNDAMENTAL_THRESHOLD,
-        RANSAC_CONFIDENCE,
-        RANSAC_ITERATIONS
-    )
+    try:
+
+        F, mask = cv2.findFundamentalMat(
+            pts1,
+            pts2,
+            cv2.FM_RANSAC,
+            FUNDAMENTAL_THRESHOLD,
+            RANSAC_CONFIDENCE,
+            RANSAC_ITERATIONS
+        )
+
+    except Exception:
+
+        return (
+            None,
+            np.zeros(
+                len(matches),
+                dtype=np.uint8
+            )
+        )
 
     if mask is None:
 
@@ -348,14 +394,26 @@ def calculate_homography(
         for m in matches
     ])
 
-    H, mask = cv2.findHomography(
-        pts1,
-        pts2,
-        cv2.RANSAC,
-        HOMOGRAPHY_THRESHOLD,
-        maxIters=RANSAC_ITERATIONS,
-        confidence=RANSAC_CONFIDENCE
-    )
+    try:
+
+        H, mask = cv2.findHomography(
+            pts1,
+            pts2,
+            cv2.RANSAC,
+            HOMOGRAPHY_THRESHOLD,
+            maxIters=RANSAC_ITERATIONS,
+            confidence=RANSAC_CONFIDENCE
+        )
+
+    except Exception:
+
+        return (
+            None,
+            np.zeros(
+                len(matches),
+                dtype=np.uint8
+            )
+        )
 
     if mask is None:
 
@@ -400,7 +458,11 @@ def homography_rmse(
     pts1 = np.float32([
         kp1[matches[i].queryIdx].pt
         for i in indices
-    ]).reshape(-1, 1, 2)
+    ]).reshape(
+        -1,
+        1,
+        2
+    )
 
     pts2 = np.float32([
         kp2[matches[i].trainIdx].pt
@@ -412,9 +474,15 @@ def homography_rmse(
         projected = cv2.perspectiveTransform(
             pts1,
             H
-        ).reshape(-1, 2)
+        ).reshape(
+            -1,
+            2
+        )
 
-        errors = projected - pts2
+        errors = (
+            projected -
+            pts2
+        )
 
         distances = np.sqrt(
             np.sum(
@@ -482,38 +550,44 @@ def fundamental_error(
         )
     ])
 
-    lines = (
-        F @ p1.T
-    ).T
+    try:
 
-    numerator = np.abs(
-        np.sum(
-            p2 * lines,
-            axis=1
-        )
-    )
+        lines = (
+            F @ p1.T
+        ).T
 
-    denominator = np.sqrt(
-        lines[:, 0] ** 2 +
-        lines[:, 1] ** 2
-    )
-
-    denominator[
-        denominator < 1e-12
-    ] = 1e-12
-
-    distances = (
-        numerator /
-        denominator
-    )
-
-    return float(
-        np.sqrt(
-            np.mean(
-                distances ** 2
+        numerator = np.abs(
+            np.sum(
+                p2 * lines,
+                axis=1
             )
         )
-    )
+
+        denominator = np.sqrt(
+            lines[:, 0] ** 2 +
+            lines[:, 1] ** 2
+        )
+
+        denominator[
+            denominator < 1e-12
+        ] = 1e-12
+
+        distances = (
+            numerator /
+            denominator
+        )
+
+        return float(
+            np.sqrt(
+                np.mean(
+                    distances ** 2
+                )
+            )
+        )
+
+    except Exception:
+
+        return None
 
 
 # ============================================================
@@ -535,15 +609,23 @@ def spatial_analysis(
     if len(indices) == 0:
 
         return {
+
             "coverage": 0.0,
-            "dominance": 100.0,
+
+            "dominance": 0.0,
+
             "centroid": None,
+
             "points": np.empty(
                 (0, 2),
                 dtype=np.float32
             ),
+
             "grid": np.zeros(
-                (GRID_ROWS, GRID_COLS),
+                (
+                    GRID_ROWS,
+                    GRID_COLS
+                ),
                 dtype=int
             )
         }
@@ -583,7 +665,10 @@ def spatial_analysis(
     )
 
     grid = np.zeros(
-        (GRID_ROWS, GRID_COLS),
+        (
+            GRID_ROWS,
+            GRID_COLS
+        ),
         dtype=int
     )
 
@@ -605,7 +690,10 @@ def spatial_analysis(
             )
         )
 
-        grid[row, col] += 1
+        grid[
+            row,
+            col
+        ] += 1
 
     occupied = np.sum(
         grid > 0
@@ -613,7 +701,10 @@ def spatial_analysis(
 
     coverage = (
         occupied /
-        (GRID_ROWS * GRID_COLS)
+        (
+            GRID_ROWS *
+            GRID_COLS
+        )
     ) * 100.0
 
     dominance = (
@@ -656,7 +747,11 @@ def consistency(
     f_inliers
 ):
 
-    if h_inliers == 0 or f_inliers == 0:
+    if (
+        h_inliers == 0
+        or
+        f_inliers == 0
+    ):
 
         return 0.0
 
@@ -673,7 +768,7 @@ def consistency(
 
 
 # ============================================================
-# CONFIDENCE SCORE
+# BASE GEOMETRIC CONFIDENCE
 # ============================================================
 
 def calculate_confidence(
@@ -689,45 +784,28 @@ def calculate_confidence(
     if good <= 0:
         return 0.0
 
-    # Quantity of verified evidence
     match_signal = min(
         100.0,
         selected_inliers * 6.0
     )
 
-    # Percentage of matches agreeing
     ratio_signal = min(
         100.0,
-        selected_ratio * 3.0
+        selected_ratio
     )
 
-    # Spatial distribution
     spatial_signal = (
-        0.65 * coverage +
-        0.35 * (
+        0.55 * coverage +
+        0.45 * (
             100.0 -
-            min(
-                100.0,
-                max(
-                    0.0,
-                    dominance - 25.0
-                )
-            )
+            dominance
         )
     )
 
-    spatial_signal = np.clip(
-        spatial_signal,
-        0,
-        100
-    )
-
-    # Agreement between models
     agreement_signal = (
         model_consistency
     )
 
-    # Geometric error
     if rmse is None:
 
         error_signal = 35.0
@@ -737,7 +815,7 @@ def calculate_confidence(
         error_signal = (
             100.0 *
             np.exp(
-                -rmse / 5.0
+                -rmse / 4.0
             )
         )
 
@@ -749,7 +827,7 @@ def calculate_confidence(
 
     score = (
 
-        0.22 *
+        0.20 *
         match_signal
 
         +
@@ -759,7 +837,7 @@ def calculate_confidence(
 
         +
 
-        0.18 *
+        0.20 *
         spatial_signal
 
         +
@@ -783,58 +861,359 @@ def calculate_confidence(
 
 
 # ============================================================
-# LOCALIZATION FROM HOMOGRAPHY
+# AI FEATURE GENERATION
 # ============================================================
 
-def homography_localization(
-    H,
-    reference_shape
+def build_ai_features(
+    result
 ):
 
-    if H is None:
-        return None
+    good = float(
+        result["good"]
+    )
 
-    h, w = reference_shape[:2]
+    inliers = float(
+        result["inliers"]
+    )
 
-    # Center of reference image
-    center = np.array(
-        [
-            [
-                [
-                    w / 2.0,
-                    h / 2.0
-                ]
-            ]
-        ],
+    ratio = float(
+        result["ratio"]
+    )
+
+    h_inliers = float(
+        result["h_inliers"]
+    )
+
+    f_inliers = float(
+        result["f_inliers"]
+    )
+
+    coverage = float(
+        result["spatial"]["coverage"]
+    )
+
+    dominance = float(
+        result["spatial"]["dominance"]
+    )
+
+    agreement = float(
+        result["agreement"]
+    )
+
+    if result["f_error"] is None:
+
+        f_error = 20.0
+
+    else:
+
+        f_error = min(
+            20.0,
+            float(
+                result["f_error"]
+            )
+        )
+
+    if result["h_rmse"] is None:
+
+        h_rmse = 20.0
+
+    else:
+
+        h_rmse = min(
+            20.0,
+            float(
+                result["h_rmse"]
+            )
+        )
+
+    inlier_ratio = (
+        inliers /
+        max(
+            good,
+            1.0
+        )
+    ) * 100.0
+
+    return np.array([
+
+        np.log1p(good),
+
+        np.log1p(inliers),
+
+        ratio,
+
+        inlier_ratio,
+
+        np.log1p(h_inliers),
+
+        np.log1p(f_inliers),
+
+        coverage,
+
+        dominance,
+
+        agreement,
+
+        f_error,
+
+        h_rmse
+
+    ], dtype=np.float32)
+
+
+# ============================================================
+# LIGHTWEIGHT AI MODEL
+# ============================================================
+
+def train_ai_model():
+
+    # --------------------------------------------------------
+    # Synthetic evidence training set
+    #
+    # This is an initialization model.
+    # Positive samples represent internally consistent
+    # correspondence evidence.
+    #
+    # Negative samples represent weak/inconsistent evidence.
+    # --------------------------------------------------------
+
+    rng = np.random.default_rng(
+        AI_RANDOM_STATE
+    )
+
+    X = []
+    y = []
+
+    # Positive evidence
+    for _ in range(400):
+
+        good = rng.uniform(
+            40,
+            250
+        )
+
+        inliers = rng.uniform(
+            12,
+            min(
+                50,
+                good
+            )
+        )
+
+        ratio = rng.uniform(
+            8,
+            35
+        )
+
+        h_in = rng.uniform(
+            8,
+            25
+        )
+
+        f_in = rng.uniform(
+            8,
+            25
+        )
+
+        coverage = rng.uniform(
+            30,
+            100
+        )
+
+        dominance = rng.uniform(
+            15,
+            45
+        )
+
+        agreement = rng.uniform(
+            55,
+            100
+        )
+
+        f_error = rng.uniform(
+            0.1,
+            3.0
+        )
+
+        h_rmse = rng.uniform(
+            0.5,
+            4.0
+        )
+
+        sample = [
+
+            np.log1p(good),
+
+            np.log1p(inliers),
+
+            ratio,
+
+            (
+                inliers /
+                max(
+                    good,
+                    1
+                )
+            ) * 100,
+
+            np.log1p(h_in),
+
+            np.log1p(f_in),
+
+            coverage,
+
+            dominance,
+
+            agreement,
+
+            f_error,
+
+            h_rmse
+        ]
+
+        X.append(sample)
+        y.append(1)
+
+    # Negative evidence
+    for _ in range(400):
+
+        good = rng.uniform(
+            10,
+            220
+        )
+
+        inliers = rng.uniform(
+            2,
+            12
+        )
+
+        ratio = rng.uniform(
+            1,
+            18
+        )
+
+        h_in = rng.uniform(
+            2,
+            10
+        )
+
+        f_in = rng.uniform(
+            2,
+            13
+        )
+
+        coverage = rng.uniform(
+            5,
+            55
+        )
+
+        dominance = rng.uniform(
+            35,
+            100
+        )
+
+        agreement = rng.uniform(
+            5,
+            65
+        )
+
+        f_error = rng.uniform(
+            3,
+            20
+        )
+
+        h_rmse = rng.uniform(
+            4,
+            20
+        )
+
+        sample = [
+
+            np.log1p(good),
+
+            np.log1p(inliers),
+
+            ratio,
+
+            (
+                inliers /
+                max(
+                    good,
+                    1
+                )
+            ) * 100,
+
+            np.log1p(h_in),
+
+            np.log1p(f_in),
+
+            coverage,
+
+            dominance,
+
+            agreement,
+
+            f_error,
+
+            h_rmse
+        ]
+
+        X.append(sample)
+        y.append(0)
+
+    X = np.array(
+        X,
         dtype=np.float32
     )
 
-    try:
+    y = np.array(
+        y,
+        dtype=np.int32
+    )
 
-        # For a correspondence system where the target is
-        # a crop of the reference, we mainly use verified
-        # reference-space points. This function is only used
-        # as an auxiliary signal.
+    scaler = StandardScaler()
 
-        projected = cv2.perspectiveTransform(
-            center,
-            H
-        )
+    X_scaled = scaler.fit_transform(
+        X
+    )
 
-        x, y = projected[0][0]
+    model = RandomForestClassifier(
+        n_estimators=AI_ESTIMATORS,
+        max_depth=8,
+        min_samples_leaf=4,
+        random_state=AI_RANDOM_STATE,
+        n_jobs=-1
+    )
 
-        if not np.isfinite(x) or not np.isfinite(y):
+    model.fit(
+        X_scaled,
+        y
+    )
 
-            return None
+    return model, scaler
 
-        return (
-            float(x),
-            float(y)
-        )
 
-    except Exception:
+print("\n")
+print("=" * 78)
+print("INITIALIZING CPU AI CONFIDENCE MODEL")
+print("=" * 78)
 
-        return None
+ai_model, ai_scaler = (
+    train_ai_model()
+)
+
+print(
+    "AI model: Random Forest"
+)
+
+print(
+    "Estimators:",
+    AI_ESTIMATORS
+)
+
+print(
+    "Execution: CPU"
+)
 
 
 # ============================================================
@@ -856,7 +1235,7 @@ for name in reference_hypotheses:
         reference_hypotheses[name]
     )
 
-    tar_img, tar_scale = (
+    tar_img, _ = (
         target_hypotheses[name]
     )
 
@@ -868,14 +1247,9 @@ for name in reference_hypotheses:
         tar_img
     )
 
-    matches = match_features(
+    matches = mutual_matching(
         des1,
         des2
-    )
-
-    # Distance-based cleanup
-    matches = distance_filter(
-        matches
     )
 
     print(
@@ -886,11 +1260,11 @@ for name in reference_hypotheses:
     )
 
     print(
-        "Good matches:",
+        "Mutual good matches:",
         len(matches)
     )
 
-    if len(matches) < MIN_GOOD_MATCHES:
+    if len(matches) < MIN_MATCHES:
 
         print(
             "Rejected: insufficient matches"
@@ -954,21 +1328,25 @@ for name in reference_hypotheses:
     )
 
     # --------------------------------------------------------
-    # SELECT BEST GEOMETRIC MODEL
+    # MODEL SELECTION
     # --------------------------------------------------------
 
-    # Homography gets preference when its support is close
-    # to the Fundamental model and spatial evidence is good.
-
     if (
-        h_inliers >= MIN_HOMOGRAPHY_INLIERS
+
+        h_inliers >= 8
+
         and
-        h_inliers >= 0.70 * max(
-            1,
-            f_inliers
+
+        h_ratio >= 8
+
+        and
+
+        h_inliers >=
+        0.70 * max(
+            f_inliers,
+            1
         )
-        and
-        h_ratio >= 8.0
+
     ):
 
         model = "Homography"
@@ -981,7 +1359,7 @@ for name in reference_hypotheses:
 
         rmse = h_rmse
 
-    elif f_inliers >= MIN_FUNDAMENTAL_INLIERS:
+    elif f_inliers >= 8:
 
         model = "Fundamental"
 
@@ -993,7 +1371,7 @@ for name in reference_hypotheses:
 
         rmse = f_error
 
-    elif h_inliers >= MIN_HOMOGRAPHY_INLIERS:
+    elif h_inliers >= 6:
 
         model = "Homography"
 
@@ -1007,18 +1385,11 @@ for name in reference_hypotheses:
 
     else:
 
-        model = "Unverified"
-
-        mask = np.zeros(
-            len(matches),
-            dtype=np.uint8
+        print(
+            "Rejected: weak geometry"
         )
 
-        inliers = 0
-
-        ratio = 0.0
-
-        rmse = None
+        continue
 
     # --------------------------------------------------------
     # SPATIAL ANALYSIS
@@ -1036,19 +1407,17 @@ for name in reference_hypotheses:
         "centroid"
     ]
 
-    # --------------------------------------------------------
-    # CONFIDENCE
-    # --------------------------------------------------------
+    if location is None:
 
-    conf = calculate_confidence(
-        len(matches),
-        inliers,
-        ratio,
-        spatial["coverage"],
-        spatial["dominance"],
-        agreement,
-        rmse
-    )
+        print(
+            "Rejected: no valid localization"
+        )
+
+        continue
+
+    # --------------------------------------------------------
+    # RESULT OBJECT
+    # --------------------------------------------------------
 
     result = {
 
@@ -1092,19 +1461,98 @@ for name in reference_hypotheses:
 
         "location": location,
 
-        "confidence": conf,
+        "confidence": 0.0,
 
-        "H": H,
+        "ai_confidence": 0.0,
 
-        "F": F
+        "final_score": 0.0
     }
+
+    # --------------------------------------------------------
+    # CLASSICAL CONFIDENCE
+    # --------------------------------------------------------
+
+    base_conf = calculate_confidence(
+
+        len(matches),
+
+        inliers,
+
+        ratio,
+
+        spatial[
+            "coverage"
+        ],
+
+        spatial[
+            "dominance"
+        ],
+
+        agreement,
+
+        rmse
+    )
+
+    result[
+        "confidence"
+    ] = base_conf
+
+    # --------------------------------------------------------
+    # AI FEATURES
+    # --------------------------------------------------------
+
+    ai_features = build_ai_features(
+        result
+    )
+
+    ai_scaled = ai_scaler.transform(
+        ai_features.reshape(
+            1,
+            -1
+        )
+    )
+
+    ai_probability = ai_model.predict_proba(
+        ai_scaled
+    )[0, 1] * 100.0
+
+    result[
+        "ai_confidence"
+    ] = float(
+        ai_probability
+    )
+
+    # --------------------------------------------------------
+    # MULTI-SIGNAL FUSION
+    # --------------------------------------------------------
+
+    final_score = (
+
+        0.55 *
+        base_conf
+
+        +
+
+        0.45 *
+        ai_probability
+    )
+
+    result[
+        "final_score"
+    ] = float(
+        np.clip(
+            final_score,
+            0,
+            100
+        )
+    )
 
     results.append(
         result
     )
 
     # --------------------------------------------------------
-    # OUTPUT
+    # PRINT RESULTS
     # --------------------------------------------------------
 
     print(
@@ -1142,54 +1590,70 @@ for name in reference_hypotheses:
         f"{spatial['dominance']:.2f}%"
     )
 
-    if location:
-
-        print(
-            "Localization:",
-            f"({location[0]:.2f}, "
-            f"{location[1]:.2f})"
-        )
-
-    else:
-
-        print(
-            "Localization: INVALID"
-        )
+    print(
+        "Classical confidence:",
+        f"{base_conf:.2f}%"
+    )
 
     print(
-        "Confidence:",
-        f"{conf:.2f}%"
+        "AI confidence:",
+        f"{ai_probability:.2f}%"
+    )
+
+    print(
+        "Fused confidence:",
+        f"{result['final_score']:.2f}%"
+    )
+
+    print(
+        "Localization:",
+        f"({location[0]:.2f}, "
+        f"{location[1]:.2f})"
     )
 
 
 # ============================================================
-# NO RESULTS
+# NO RESULTS CHECK
 # ============================================================
 
 if not results:
 
     print("\n")
     print("=" * 78)
-    print("NO LOCALIZATION")
+    print("NO RELIABLE LOCALIZATION FOUND")
     print("=" * 78)
 
-    raise RuntimeError(
-        "No usable feature correspondences found."
+    print(
+        "\nV3 could not obtain sufficient "
+        "geometric evidence."
     )
 
+    report_path = os.path.join(
+        REPORT_DIR,
+        "final_report.txt"
+    )
 
-# ============================================================
-# TRUSTED RESULTS
-# ============================================================
+    with open(
+        report_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
 
-valid = [
+        f.write(
+            "SIH26166 V3 RESULT\n"
+        )
 
-    r for r in results
+        f.write(
+            "NO RELIABLE LOCALIZATION FOUND\n"
+        )
 
-    if r["location"] is not None
+        f.write(
+            "Insufficient geometric evidence.\n"
+        )
 
-    and r["inliers"] >= 4
-]
+    raise RuntimeError(
+        "V3 failed: no reliable localization."
+    )
 
 
 # ============================================================
@@ -1198,77 +1662,58 @@ valid = [
 
 print("\n")
 print("=" * 78)
-print("TRUSTED HYPOTHESIS CONSENSUS")
+print("AI + GEOMETRIC CROSS-HYPOTHESIS CONSENSUS")
 print("=" * 78)
 
-if len(valid) == 0:
+valid = [
 
-    print(
-        "\nNo geometrically verified localization."
-    )
+    r for r in results
 
-    # Safe fallback for prototype demonstration
+    if r["location"] is not None
+
+    and r["inliers"] >= MIN_INLIERS
+
+    and r["final_score"] >= 40
+]
+
+
+if not valid:
+
     best = max(
         results,
-        key=lambda r: (
-            r["confidence"],
-            r["good"]
-        )
-    )
-
-    raw_mask = np.ones(
-        len(best["matches"]),
-        dtype=np.uint8
-    )
-
-    raw_spatial = spatial_analysis(
-        best["kp1"],
-        best["matches"],
-        raw_mask,
-        best["scale"],
-        reference.shape
+        key=lambda r:
+        r["final_score"]
     )
 
     final_x, final_y = (
-        raw_spatial["centroid"]
+        best["location"]
     )
 
-    consensus_score = 15.0
-
-    consensus_mask = None
+    consensus_score = (
+        best["final_score"] *
+        0.50
+    )
 
     print(
-        "Prototype fallback location:",
-        f"({final_x:.2f}, {final_y:.2f})"
+        "\nNo strong consensus."
+    )
+
+    print(
+        "Using best available hypothesis."
     )
 
 else:
 
     locations = np.array([
+
         r["location"]
-        for r in valid
-    ])
-
-    # Weight by inliers and confidence
-    weights = np.array([
-
-        max(
-            1.0,
-            r["inliers"]
-        )
-
-        *
-
-        max(
-            0.10,
-            r["confidence"] / 100.0
-        )
 
         for r in valid
+
     ])
 
     # --------------------------------------------------------
-    # MEDIAN CENTER
+    # Robust median center
     # --------------------------------------------------------
 
     median_x = np.median(
@@ -1294,15 +1739,17 @@ else:
         ) ** 2
     )
 
-    median_distance = np.median(
-        distances
-    )
-
     adaptive_radius = max(
-        MIN_CONSENSUS_RADIUS,
+
+        180.0,
+
         min(
-            MAX_CONSENSUS_RADIUS,
-            median_distance * 3.0
+
+            550.0,
+
+            np.median(
+                distances
+            ) * 2.5
         )
     )
 
@@ -1311,22 +1758,59 @@ else:
         adaptive_radius
     )
 
-    # If everything is wildly separated, use the closest
-    # cluster member rather than pretending all are equivalent.
-    if np.sum(consensus_mask) == 0:
+    if np.sum(
+        consensus_mask
+    ) == 0:
 
         nearest = np.argmin(
             distances
         )
 
-        consensus_mask[nearest] = True
+        consensus_mask[
+            nearest
+        ] = True
 
     selected_locations = (
-        locations[consensus_mask]
+        locations[
+            consensus_mask
+        ]
     )
 
+    # --------------------------------------------------------
+    # AI-weighted evidence
+    # --------------------------------------------------------
+
+    weights = np.array([
+
+        max(
+            1.0,
+            r["inliers"]
+        )
+
+        *
+
+        max(
+            0.10,
+            r["final_score"] /
+            100.0
+        )
+
+        *
+
+        max(
+            0.10,
+            r["ai_confidence"] /
+            100.0
+        )
+
+        for r in valid
+
+    ])
+
     selected_weights = (
-        weights[consensus_mask]
+        weights[
+            consensus_mask
+        ]
     )
 
     final_x = float(
@@ -1345,12 +1829,19 @@ else:
 
     consensus_ratio = (
 
-        np.sum(consensus_mask) /
+        np.sum(
+            consensus_mask
+        )
+
+        /
+
         len(valid)
 
     )
 
-    if len(selected_locations) > 1:
+    if len(
+        selected_locations
+    ) > 1:
 
         spread = np.mean(
 
@@ -1367,12 +1858,16 @@ else:
                     selected_locations[:, 1] -
                     final_y
                 ) ** 2
+
             )
         )
 
         spread_signal = max(
+
             0.0,
+
             100.0 -
+
             min(
                 100.0,
                 spread / 5.0
@@ -1381,7 +1876,7 @@ else:
 
     else:
 
-        spread_signal = 35.0
+        spread_signal = 30.0
 
     consensus_score = (
 
@@ -1396,8 +1891,11 @@ else:
     )
 
     best = max(
+
         valid,
-        key=lambda r: r["confidence"]
+
+        key=lambda r:
+        r["final_score"]
     )
 
     print(
@@ -1408,7 +1906,9 @@ else:
     print(
         "Consensus hypotheses:",
         int(
-            np.sum(consensus_mask)
+            np.sum(
+                consensus_mask
+            )
         )
     )
 
@@ -1451,7 +1951,7 @@ final_y = float(
 
 
 # ============================================================
-# NORMALIZED COORDINATES
+# NORMALIZED LOCATION
 # ============================================================
 
 normalized_x = (
@@ -1473,36 +1973,29 @@ normalized_y = (
 # FINAL CONFIDENCE
 # ============================================================
 
-base_confidence = best[
-    "confidence"
-]
+base_confidence = (
+    best["confidence"]
+)
 
-if len(valid) > 0:
+ai_confidence = (
+    best["ai_confidence"]
+)
 
-    final_confidence = (
+final_confidence = (
 
-        0.65 *
-        base_confidence
+    0.40 *
+    base_confidence
 
-        +
+    +
 
-        0.35 *
-        consensus_score
-    )
+    0.30 *
+    ai_confidence
 
-else:
+    +
 
-    final_confidence = (
-
-        0.60 *
-        base_confidence
-
-        +
-
-        0.40 *
-        consensus_score
-    )
-
+    0.30 *
+    consensus_score
+)
 
 final_confidence = float(
     np.clip(
@@ -1525,15 +2018,17 @@ if (
 
     best["inliers"] >= 12
 
+    and
+
+    consensus_score >= 65
+
 ):
 
-    decision = (
-        "HIGH CONFIDENCE"
-    )
+    decision = "HIGH CONFIDENCE"
 
 elif (
 
-    final_confidence >= 50
+    final_confidence >= 55
 
     and
 
@@ -1541,15 +2036,11 @@ elif (
 
 ):
 
-    decision = (
-        "MODERATE CONFIDENCE"
-    )
+    decision = "MODERATE CONFIDENCE"
 
 else:
 
-    decision = (
-        "LOW CONFIDENCE"
-    )
+    decision = "LOW CONFIDENCE"
 
 
 # ============================================================
@@ -1558,16 +2049,18 @@ else:
 
 print("\n")
 print("=" * 78)
-print("FINAL CORRESPONDENCE REPORT")
+print("FINAL V3 CORRESPONDENCE REPORT")
 print("=" * 78)
 
 print(
+
     f"\n{'METHOD':<24}"
     f"{'MODEL':<18}"
     f"{'GOOD':>7}"
     f"{'H-IN':>8}"
     f"{'F-IN':>8}"
-    f"{'CONF.':>11}"
+    f"{'AI':>10}"
+    f"{'FUSED':>10}"
 )
 
 print("-" * 78)
@@ -1575,18 +2068,26 @@ print("-" * 78)
 for r in results:
 
     print(
+
         f"{r['name']:<24}"
+
         f"{r['model']:<18}"
+
         f"{r['good']:>7}"
+
         f"{r['h_inliers']:>8}"
+
         f"{r['f_inliers']:>8}"
-        f"{r['confidence']:>10.2f}%"
+
+        f"{r['ai_confidence']:>9.2f}%"
+
+        f"{r['final_score']:>9.2f}%"
     )
 
 
 print("\n")
 print("=" * 78)
-print("FINAL LOCALIZATION")
+print("FINAL V3 LOCALIZATION")
 print("=" * 78)
 
 print(
@@ -1610,8 +2111,13 @@ print(
 )
 
 print(
-    "Best hypothesis confidence:",
+    "Classical confidence:",
     f"{best['confidence']:.2f}%"
+)
+
+print(
+    "AI confidence:",
+    f"{best['ai_confidence']:.2f}%"
 )
 
 print(
@@ -1652,7 +2158,7 @@ height, width = reference.shape[:2]
 
 
 # ------------------------------------------------------------
-# Grid
+# GRID
 # ------------------------------------------------------------
 
 for i in range(
@@ -1667,10 +2173,15 @@ for i in range(
     )
 
     cv2.line(
+
         visual,
+
         (xg, 0),
+
         (xg, height),
+
         (255, 255, 255),
+
         2
     )
 
@@ -1687,16 +2198,21 @@ for i in range(
     )
 
     cv2.line(
+
         visual,
+
         (0, yg),
+
         (width, yg),
+
         (255, 255, 255),
+
         2
     )
 
 
 # ------------------------------------------------------------
-# Draw verified inliers
+# DRAW BEST INLIERS
 # ------------------------------------------------------------
 
 for i, m in enumerate(
@@ -1710,8 +2226,13 @@ for i, m in enumerate(
         "kp1"
     ][m.queryIdx].pt
 
-    px /= best["scale"]
-    py /= best["scale"]
+    px /= best[
+        "scale"
+    ]
+
+    py /= best[
+        "scale"
+    ]
 
     px = int(
         np.clip(
@@ -1730,123 +2251,197 @@ for i, m in enumerate(
     )
 
     cv2.circle(
+
         visual,
+
         (px, py),
-        9,
+
+        10,
+
         (0, 255, 0),
+
         -1
     )
 
 
 # ------------------------------------------------------------
-# Final localization marker
+# FINAL LOCATION
 # ------------------------------------------------------------
 
 cv2.circle(
+
     visual,
+
     (
         int(final_x),
         int(final_y)
     ),
+
     45,
+
     (0, 0, 255),
+
     6
 )
 
 cv2.drawMarker(
+
     visual,
+
     (
         int(final_x),
         int(final_y)
     ),
+
     (0, 0, 255),
+
     cv2.MARKER_CROSS,
+
     110,
+
     7
 )
 
 
 # ------------------------------------------------------------
-# Text panel
+# TEXT
 # ------------------------------------------------------------
 
+font = cv2.FONT_HERSHEY_SIMPLEX
+
 cv2.putText(
+
     visual,
-    "SIH26166 V2 LOCALIZATION",
+
+    "SIH26166 V3 AI LOCALIZATION",
+
     (40, 60),
-    cv2.FONT_HERSHEY_SIMPLEX,
-    1.15,
+
+    font,
+
+    1.2,
+
     (255, 255, 255),
+
     3
 )
 
 cv2.putText(
+
     visual,
+
     f"Evidence: {best['name']}",
+
     (40, 105),
-    cv2.FONT_HERSHEY_SIMPLEX,
+
+    font,
+
     0.75,
+
     (255, 255, 255),
+
     2
 )
 
 cv2.putText(
+
     visual,
+
     f"Model: {best['model']}",
+
     (40, 145),
-    cv2.FONT_HERSHEY_SIMPLEX,
+
+    font,
+
     0.75,
+
     (255, 255, 255),
+
     2
 )
 
 cv2.putText(
+
     visual,
-    f"Good matches: {best['good']}",
+
+    f"Inliers: {best['inliers']}",
+
     (40, 185),
-    cv2.FONT_HERSHEY_SIMPLEX,
+
+    font,
+
     0.75,
+
     (255, 255, 255),
+
     2
 )
 
 cv2.putText(
+
     visual,
-    f"Verified inliers: {best['inliers']}",
+
+    f"AI Confidence: {ai_confidence:.1f}%",
+
     (40, 225),
-    cv2.FONT_HERSHEY_SIMPLEX,
+
+    font,
+
     0.75,
+
     (255, 255, 255),
+
     2
 )
 
 cv2.putText(
+
     visual,
-    f"Confidence: {final_confidence:.1f}%",
+
+    f"Final Confidence: {final_confidence:.1f}%",
+
     (40, 265),
-    cv2.FONT_HERSHEY_SIMPLEX,
+
+    font,
+
     0.75,
+
     (255, 255, 255),
+
     2
 )
 
 cv2.putText(
+
     visual,
+
     f"Location: ({final_x:.0f}, {final_y:.0f})",
+
     (40, 305),
-    cv2.FONT_HERSHEY_SIMPLEX,
+
+    font,
+
     0.75,
+
     (255, 255, 255),
+
     2
 )
 
 cv2.putText(
+
     visual,
+
     decision,
+
     (40, 345),
-    cv2.FONT_HERSHEY_SIMPLEX,
+
+    font,
+
     0.85,
+
     (255, 255, 255),
+
     2
 )
 
@@ -1856,12 +2451,16 @@ cv2.putText(
 # ============================================================
 
 visual_path = os.path.join(
+
     VIS_DIR,
-    "final_result.jpg"
+
+    "final_result_v3.jpg"
 )
 
 cv2.imwrite(
+
     visual_path,
+
     visual
 )
 
@@ -1871,14 +2470,21 @@ cv2.imwrite(
 # ============================================================
 
 report_path = os.path.join(
+
     REPORT_DIR,
-    "final_report.txt"
+
+    "final_report_v3.txt"
 )
 
+
 with open(
+
     report_path,
+
     "w",
+
     encoding="utf-8"
+
 ) as f:
 
     f.write(
@@ -1886,7 +2492,7 @@ with open(
     )
 
     f.write(
-        "V2 ROBUST MULTI-SIGNAL LOCALIZATION PIPELINE\n"
+        "V3 AI-ASSISTED CPU-FIRST LOCALIZATION\n"
     )
 
     f.write(
@@ -1907,30 +2513,19 @@ with open(
     )
 
     f.write(
-        "CONFIGURATION\n"
+        "AI MODEL\n"
     )
 
     f.write(
-        "-" * 78 +
-        "\n"
+        "Random Forest classifier\n"
     )
 
     f.write(
-        f"SIFT features: {SIFT_FEATURES}\n"
+        f"Estimators: {AI_ESTIMATORS}\n"
     )
 
     f.write(
-        f"Lowe ratio: {LOWE_RATIO}\n"
-    )
-
-    f.write(
-        f"Fundamental threshold: "
-        f"{FUNDAMENTAL_THRESHOLD}\n"
-    )
-
-    f.write(
-        f"Homography threshold: "
-        f"{HOMOGRAPHY_THRESHOLD}\n\n"
+        "Execution: CPU\n\n"
     )
 
     f.write(
@@ -1991,6 +2586,21 @@ with open(
             f"{r['agreement']:.2f}%\n"
         )
 
+        f.write(
+            f"Classical confidence: "
+            f"{r['confidence']:.2f}%\n"
+        )
+
+        f.write(
+            f"AI confidence: "
+            f"{r['ai_confidence']:.2f}%\n"
+        )
+
+        f.write(
+            f"Fused confidence: "
+            f"{r['final_score']:.2f}%\n"
+        )
+
         if r["location"]:
 
             f.write(
@@ -1999,16 +2609,7 @@ with open(
                 f"{r['location'][1]:.2f})\n"
             )
 
-        else:
-
-            f.write(
-                "Localization: INVALID\n"
-            )
-
-        f.write(
-            f"Confidence: "
-            f"{r['confidence']:.2f}%\n\n"
-        )
+        f.write("\n")
 
 
     f.write(
@@ -2046,8 +2647,13 @@ with open(
     )
 
     f.write(
-        f"Best hypothesis confidence: "
+        f"Classical confidence: "
         f"{best['confidence']:.2f}%\n"
+    )
+
+    f.write(
+        f"AI confidence: "
+        f"{best['ai_confidence']:.2f}%\n"
     )
 
     f.write(
@@ -2085,18 +2691,6 @@ with open(
         f"{decision}\n"
     )
 
-    f.write(
-        "\nNOTE:\n"
-    )
-
-    f.write(
-        "This V2 implementation is a prototype localization\n"
-        "pipeline. Confidence represents an engineering score,\n"
-        "not a calibrated probability. Final scientific validation\n"
-        "requires known Chandrayaan-2 reference coordinates,\n"
-        "camera geometry and independent ground truth.\n"
-    )
-
 
 # ============================================================
 # COMPLETION
@@ -2104,7 +2698,7 @@ with open(
 
 print("\n")
 print("=" * 78)
-print("V2 PIPELINE COMPLETED")
+print("V3 PIPELINE COMPLETED")
 print("=" * 78)
 
 print("\nVisualization:")
@@ -2125,7 +2719,12 @@ print(
 )
 
 print(
-    f"Confidence: "
+    f"AI confidence: "
+    f"{ai_confidence:.2f}%"
+)
+
+print(
+    f"Final confidence: "
     f"{final_confidence:.2f}%"
 )
 
