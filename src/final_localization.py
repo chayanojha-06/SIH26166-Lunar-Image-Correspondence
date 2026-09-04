@@ -28,7 +28,7 @@ print("=" * 78)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-IMAGE_DIR = os.path.join(BASE_DIR, "data", "images")
+IMAGE_DIR = os.path.join(BASE_DIR, "data", "raw")
 MODEL_PATH = os.path.join(
     BASE_DIR, "models", "lunar_correspondence_rf_v45.pkl"
 )
@@ -503,7 +503,16 @@ def process_pair(target_name, reference_name):
         + 0.15 * coverage
     )
 
-    # Strong penalty when geometry is genuinely weak
+    # ----------------------------------------------------------
+    # EVIDENCE-AWARE GEOMETRY PENALTY
+    # ----------------------------------------------------------
+    # A high geometric score from only a handful of matches is
+    # not strong evidence. Small random subsets can occasionally
+    # fit a homography/fundamental matrix by chance.
+    #
+    # Genuine strong correspondences in this pipeline normally
+    # contain substantially more inliers than these minimums.
+
     if F_inliers < 5:
         geometry *= 0.60
 
@@ -512,6 +521,19 @@ def process_pair(target_name, reference_name):
 
     if coverage < 30:
         geometry *= 0.70
+
+    # Low match-count penalty
+    if len(good) < 15:
+        geometry *= 0.60
+    elif len(good) < 30:
+        geometry *= 0.80
+
+    # Require stronger inlier evidence for a high geometry score
+    if F_inliers < 10:
+        geometry *= 0.80
+
+    if H_inliers < 6:
+        geometry *= 0.85
 
     geometry = clamp(geometry)
 
@@ -525,10 +547,11 @@ def process_pair(target_name, reference_name):
     # We need actual geometric agreement.
     if (
         H is not None
-        and F_inliers >= 6
-        and H_inliers >= 4
-        and F_ratio >= 0.25
-        and H_ratio >= 0.20
+        and len(good) >= 10
+        and F_inliers >= 8
+        and H_inliers >= 5
+        and F_ratio >= 0.35
+        and H_ratio >= 0.30
         and H_error <= 15
     ):
 
@@ -590,8 +613,18 @@ def process_pair(target_name, reference_name):
     # AI = supporting evidence.
     # Geometry + localization = primary evidence.
 
+    # AI is supporting evidence, not a substitute for geometric
+    # evidence. In particular, classifier confidence can be very
+    # high on a tiny feature set, so reduce its influence there.
+    ai_for_score = ai_conf
+
+    if len(good) < 15:
+        ai_for_score *= 0.35
+    elif len(good) < 30:
+        ai_for_score *= 0.70
+
     score = (
-        0.20 * ai_conf
+        0.20 * ai_for_score
         + 0.45 * geometry
         + 0.35 * localization
     )
@@ -603,14 +636,18 @@ def process_pair(target_name, reference_name):
     # ----------------------------------------------------------
     # DECISION
     # ----------------------------------------------------------
+    # Strong requires meaningful correspondence evidence.
+    # A tiny number of matches must never become STRONG merely
+    # because the classifier is confident.
 
     if (
         score >= 72
         and ai_conf >= 75
         and geometry >= 55
         and localization >= 55
-        and F_inliers >= 7
-        and H_inliers >= 4
+        and len(good) >= 20
+        and F_inliers >= 10
+        and H_inliers >= 6
     ):
 
         decision = "ACCEPT / STRONG CORRESPONDENCE"
@@ -619,8 +656,9 @@ def process_pair(target_name, reference_name):
         score >= 60
         and geometry >= 45
         and localization >= 40
-        and F_inliers >= 6
-        and H_inliers >= 4
+        and len(good) >= 12
+        and F_inliers >= 8
+        and H_inliers >= 5
     ):
 
         decision = "ACCEPT / MODERATE CORRESPONDENCE"
@@ -628,6 +666,7 @@ def process_pair(target_name, reference_name):
     elif (
         score >= 45
         and geometry >= 35
+        and len(good) >= 8
         and F_inliers >= 5
         and H_inliers >= 4
     ):
@@ -650,6 +689,7 @@ def process_pair(target_name, reference_name):
         "H_error": H_error,
         "coverage": coverage,
         "ai": ai_conf,
+        "ai_for_score": ai_for_score,
         "prediction": prediction,
         "geometry": geometry,
         "localization": localization,
@@ -703,6 +743,7 @@ for target in image_files:
             f"{'POSITIVE' if result['prediction'] else 'NEGATIVE'}"
         )
         print(f"AI confidence      : {result['ai']:.2f}%")
+        print(f"AI used in score   : {result['ai_for_score']:.2f}%")
         print(f"Geometry score     : {result['geometry']:.2f}%")
         print(
             f"Localization conf. : "
@@ -750,6 +791,7 @@ for i, r in enumerate(results, 1):
     )
 
     print(f"   AI confidence : {r['ai']:.2f}%")
+    print(f"   AI used score : {r['ai_for_score']:.2f}%")
     print(f"   Geometry      : {r['geometry']:.2f}%")
     print(f"   Localization  : {r['localization']:.2f}%")
     print(f"   Matches       : {r['matches']}")
@@ -775,6 +817,7 @@ print(
 )
 
 print(f"AI confidence      : {best['ai']:.2f}%")
+print(f"AI used in score   : {best['ai_for_score']:.2f}%")
 print(f"Geometry score     : {best['geometry']:.2f}%")
 print(
     f"Localization conf. : "
@@ -945,6 +988,7 @@ for r in results:
         "homography_error": r["H_error"],
         "spatial_coverage": r["coverage"],
         "ai_confidence": r["ai"],
+        "ai_used_in_score": r["ai_for_score"],
         "geometry_score": r["geometry"],
         "localization_confidence": r["localization"],
         "final_score": r["score"],
@@ -997,6 +1041,10 @@ with open(
 
     f.write(
         f"AI confidence      : {best['ai']:.2f}%\n"
+    )
+
+    f.write(
+        f"AI used in score   : {best['ai_for_score']:.2f}%\n"
     )
 
     f.write(
@@ -1087,6 +1135,10 @@ with open(
 
         f.write(
             f"AI confidence: {r['ai']:.2f}%\n"
+        )
+
+        f.write(
+            f"AI used in score: {r['ai_for_score']:.2f}%\n"
         )
 
         f.write(
